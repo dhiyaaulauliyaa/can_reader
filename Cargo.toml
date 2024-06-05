@@ -1,0 +1,10 @@
+[package]
+name = "can_reader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+socketcan = "3.3.0"
+can-dbc = "6.0.0"
+log = "0.4.21"
+canparse = {git = "https://github.com/Ion-Mobility/canparse", branch = "0xkelvin/parse_signals"}
