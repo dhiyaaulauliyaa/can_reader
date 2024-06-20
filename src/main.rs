@@ -1,3 +1,4 @@
+use can_dbc::DBC;
 use canparse::pgn::{ParseMessage, PgnLibrary};
 use log::error;
 use socketcan::EmbeddedFrame;
@@ -6,36 +7,21 @@ use socketcan::{CanSocket, Socket};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::prelude::*;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
 fn main() {
-    // Prepare DBC File
-    let mut packets_hash_map: HashMap<String, (PgnLibrary, Vec<String>)> = HashMap::new();
     let dbc_file_path = "/usr/share/can-dbcs/consolidated.dbc";
-    let mut file = match File::open(dbc_file_path) {
-        Ok(file) => file,
-        Err(e) => {
-            error!("Failed to open dbc file: {}", e);
-            return; // Exit the function early if the file cannot be opened
-        }
-    };
 
-    let mut file_string = String::new();
-    // Read the file to string and handle potential errors
-    if let Err(e) = file.read_to_string(&mut file_string) {
-        error!("Failed to read the dbc file into a string: {}", e);
-        return; // Exit the function early if reading fails
-    }
+    let mut dbc_file = File::open(dbc_file_path).expect("DBC file not found");
+    let mut dbc_file_buffer = Vec::new();
+    dbc_file
+        .read_to_end(&mut dbc_file_buffer)
+        .expect("Failed to open DBC file");
 
-    let buffer = file_string.as_bytes();
-    let dbc = match can_dbc::DBC::from_slice(buffer) {
-        Ok(dbc) => dbc,
-        Err(_e) => {
-            error!("Failed to parse dbc file");
-            return;
-        }
-    };
+    let dbc = can_dbc::DBC::from_slice(&dbc_file_buffer).expect("Failed to parse dbc file");
 
     let pgn_lib = match PgnLibrary::from_dbc_file(dbc_file_path) {
         Ok(lib) => lib,
@@ -45,21 +31,43 @@ fn main() {
         }
     };
 
-    let dbc_messages = dbc.messages().to_owned();
-    for message in dbc_messages {
-        let mut values_vec: Vec<String> = Vec::new();
-        for signal in message.signals() {
-            let signal_name = signal.name().to_owned();
-            let signal_name_str = signal_name.as_str();
-            values_vec.push(signal_name_str.to_owned());
+    let message_filter = vec![
+        "vcu_status_pkt_10",
+        "vcu_status_pkt_3",
+        "vcu_status_pkt_4",
+        "vcu_status_pkt_5",
+        "vcu_err_pkt_1",
+        "vcu_ble_pkt_1",
+        "vcu_status_pkt_8",
+        "vcu_screen_controller",
+        "vcu_status_pkt_13",
+        "vcu_status_pkt_1",
+        "tpms_status_pkt",
+        "screen_brightness_pkt",
+        "vcu_ota_pkt",
+    ];
+
+    let mut packets_hash_map: HashMap<u32, (PgnLibrary, Vec<String>)> = HashMap::new();
+    for message in dbc.messages() {
+        let message_name = message.message_name();
+        let include_message = message_filter.iter().find(|&&item| item == message_name);
+        if include_message.is_none() {
+            log::info!("Message not included in filter {:?}", message_name);
+            continue;
         }
+
         let message_id: u32 = match message.message_id() {
             can_dbc::MessageId::Standard(id) => *id as u32,
             can_dbc::MessageId::Extended(id) => *id,
         };
 
+        let mut values_vec: Vec<String> = Vec::new();
+        for signal in message.signals() {
+            values_vec.push(signal.name().to_owned());
+        }
+
         packets_hash_map.insert(
-            format!("0x{:08x}", message_id),
+            message_id,
             (pgn_lib.to_owned(), values_vec),
         );
     }
@@ -86,10 +94,6 @@ fn main() {
                     Id::Standard(id) => id.as_raw() as u32,
                     Id::Extended(id) => id.as_raw(),
                 };
-                // let raw_can_id_string = match frame.id() {
-                //     Id::Standard(id) => format!("{:X}", id.as_raw()),
-                //     Id::Extended(id) => format!("{:X}", id.as_raw()),
-                // };
 
                 /* Process CAN Data */
                 let mut can_data = frame.data();
@@ -101,11 +105,9 @@ fn main() {
                     can_data = &can_data_vec;
                 }
 
-                let id: String = format!("0x{:08x}", can_id);
-                match &packets_hash_map.get(&id) {
-                    None => {
-                        error!("id not found {:?}", id);
-                    }
+                /* Parse CAN Frame */
+                match &packets_hash_map.get(&can_id) {
+                    None => continue,
                     Some((pgn_lib, spns)) => {
                         let mut can_frame_map: HashMap<&str, f32> = HashMap::new();
                         for spn in spns.iter() {
@@ -113,7 +115,7 @@ fn main() {
                                 Some(def) => def,
                                 None => {
                                     error!("Couldn't get SPN definition for: {}", spn);
-                                    continue; // Skip this iteration if SPN is critical to further processing
+                                    continue;
                                 }
                             };
                             let spn_value = spn_def.parse_message(can_data);
